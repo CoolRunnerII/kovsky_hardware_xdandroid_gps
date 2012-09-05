@@ -792,8 +792,8 @@ static int gps_init(GpsCallbacks* callbacks) {
 	s->status.size = sizeof(s->status);
 	s->status.status = GPS_STATUS_NONE;
 
-	if (!s->init)
-		gps_state_init(s);
+//	if (!s->init)
+//		gps_state_init(s);
 
 	s->callbacks = *callbacks;
 
