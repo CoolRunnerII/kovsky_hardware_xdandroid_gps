@@ -7,36 +7,22 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define LOG_NDEBUG 1
 #define  LOG_TAG  "gps_msm7k"
 #include <cutils/log.h>
 #include <cutils/sockets.h>
-#include <cutils/array.h>
-
 #include <hardware/gps.h>
 
-#define XTRA_BLOCK_SIZE  400
-#define  GPS_DEBUG  0
-#define XTRA_DEBUG 1
+#define  GPS_DEBUG  1
 
 #if GPS_DEBUG
 #  define  D(...)   LOGD(__VA_ARGS__)
-#  define  V(...)   LOGV(__VA_ARGS__)
 #else
 #  define  D(...)   ((void)0)
-#  define  V(...)   ((void)0)
-#endif
-
-#if XTRA_DEBUG
-#  define pr_dbg_xtra(...)   LOGD(__VA_ARGS__)
-#else
-#  define  pr_dbg_xtra(...)   ((void)0)
 #endif
 
 /* Functions from RPC driver */
 extern void gps_get_position();
 extern void exit_gps_rpc();
-extern void start_gps_rpc();
 extern int init_gps_rpc();
 
 
@@ -183,27 +169,13 @@ typedef struct {
     char    in[ NMEA_MAX_SIZE+1 ];
 } NmeaReader;
 
-enum update_event_type {
-    STATUS,
-    SV_STATUS,
-    LOCATION
-};
-
 typedef struct {
-    int type;
-    void* object;
-} GpsUpdateEvent;
-
-typedef struct {
-    int                     init;
-    int                     fd;
-    GpsCallbacks            callbacks;
-    GpsXtraCallbacks        xtra_callbacks;
-    AGpsCallbacks           agps_callbacks;
-    int                     control[2];
-    pthread_t               thread;
-    pthread_mutex_t         update_mutex;
-    Array*                  update_events;
+	int                     init;
+	int                     fd;
+	GpsCallbacks            callbacks;
+	GpsStatus status;
+	pthread_t               thread;
+	int                     control[2];
 } GpsState;
 static GpsState  _gps_state[1];
 
@@ -425,9 +397,9 @@ nmea_reader_parse( NmeaReader*  r )
         return;
     }
     {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        _gps_state->callbacks.nmea_cb(tv.tv_sec*1000+tv.tv_usec/1000, r->in, r->pos);
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		_gps_state->callbacks.nmea_cb(tv.tv_sec*1000+tv.tv_usec/1000, r->in, r->pos);
     }
 
     nmea_tokenizer_init(tzer, r->in, r->in + r->pos);
@@ -469,9 +441,9 @@ nmea_reader_parse( NmeaReader*  r )
         nmea_reader_update_altitude(r, tok_altitude, tok_altitudeUnits);
 
     } else if ( !memcmp(tok.p, "GSA", 3) ) {
-        //Satellites are handled by RPC-side code.
+	    //Satellites are handled by RPC-side code.
     } else if ( !memcmp(tok.p, "GSV", 3) ) {
-        //Satellites are handled by RPC-side code.
+	    //Satellites are handled by RPC-side code.
     } else if ( !memcmp(tok.p, "RMC", 3) ) {
         Token  tok_time          = nmea_tokenizer_get(tzer,1);
         Token  tok_fixStatus     = nmea_tokenizer_get(tzer,2);
@@ -571,357 +543,238 @@ nmea_reader_addc( NmeaReader*  r, int  c )
 /*****************************************************************/
 
 /* commands sent to the gps thread */
-enum state_thread_cmd {
-    CMD_QUIT  = 0,
-    CMD_START = 1,
-    CMD_STOP  = 2,
-    CMD_SEND  = 3,
-    CMD_PAUSE = 4,
-    CMD_RESUME = 5
+enum {
+	CMD_QUIT  = 0,
+	CMD_START = 1,
+	CMD_STOP  = 2
 };
 
-static void gps_state_thread_ctl(GpsState* state, enum state_thread_cmd val) {
-    char cmd = (char)val;
-    int ret;
 
-    V("%s: command %d", __func__, val);
 
-    do { ret=write( state->control[0], &cmd, 1 ); }
-    while (ret < 0 && errno == EINTR);
+static void gps_state_done( GpsState*  s ) {
+	// tell the thread to quit, and wait for it
+	char   cmd = CMD_QUIT;
+	void*  dummy;
+	write( s->control[0], &cmd, 1 );
+	pthread_join(s->thread, &dummy);
 
-    if (ret != 1)
-        LOGE("%s: could not send command %d: ret=%d: %s", __func__, val, ret,
-            strerror(errno));
+	// close the control socket pair
+	close( s->control[0] ); s->control[0] = -1;
+	close( s->control[1] ); s->control[1] = -1;
+
+	// close connection to the QEMU GPS daemon
+	close( s->fd ); s->fd = -1;
+	s->init = 0;
 }
+
+
+static void
+gps_state_start( GpsState*  s )
+{
+	char  cmd = CMD_START;
+	int   ret;
+
+	do { ret=write( s->control[0], &cmd, 1 ); }
+	while (ret < 0 && errno == EINTR);
+
+	if (ret != 1)
+		D("%s: could not send CMD_START command: ret=%d: %s",
+		__FUNCTION__, ret, strerror(errno));
+}
+
+
+static void gps_state_stop( GpsState*  s ) {
+	char  cmd = CMD_STOP;
+	int   ret;
+
+	do { ret=write( s->control[0], &cmd, 1 ); }
+	while (ret < 0 && errno == EINTR);
+
+	if (ret != 1)
+		D("%s: could not send CMD_STOP command: ret=%d: %s",
+		__FUNCTION__, ret, strerror(errno));
+}
+
 
 static int epoll_register( int  epoll_fd, int  fd ) {
-    struct epoll_event  ev;
-    int                 ret, flags;
+	struct epoll_event  ev;
+	int                 ret, flags;
 
-    /* important: make the fd non-blocking */
-    flags = fcntl(fd, F_GETFL);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	/* important: make the fd non-blocking */
+	flags = fcntl(fd, F_GETFL);
+	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    ev.events  = EPOLLIN;
-    ev.data.fd = fd;
-    do {
-        ret = epoll_ctl( epoll_fd, EPOLL_CTL_ADD, fd, &ev );
-    } while (ret < 0 && errno == EINTR);
-    return ret;
+	ev.events  = EPOLLIN;
+	ev.data.fd = fd;
+	do {
+		ret = epoll_ctl( epoll_fd, EPOLL_CTL_ADD, fd, &ev );
+	} while (ret < 0 && errno == EINTR);
+	return ret;
 }
+
 
 static int epoll_deregister( int  epoll_fd, int  fd ) {
-    int  ret;
-    do {
-        ret = epoll_ctl( epoll_fd, EPOLL_CTL_DEL, fd, NULL );
-    } while (ret < 0 && errno == EINTR);
-    return ret;
-}
-
-void enqueue_update_event(void* object, enum update_event_type type) {
-    GpsState* state = _gps_state;
-
-    if (!state->init) {
-        /* There's some sparse events coming in from the rpc system after
-         * the state thread has been stopped. We just ignore these.
-         */
-        V("%s: gps state not initialized. Won't enqueue event type %d!",
-            __func__, type);
-        free(object);
-        return;
-    }
-
-    GpsUpdateEvent* event = malloc(sizeof(GpsUpdateEvent));
-    event->type = type;
-    event->object = object;
-
-    pthread_mutex_lock(&state->update_mutex);
-    arrayAdd(state->update_events, event);
-    pthread_mutex_unlock(&state->update_mutex);
-
-    gps_state_thread_ctl(state, CMD_SEND);
+	int  ret;
+	do {
+		ret = epoll_ctl( epoll_fd, EPOLL_CTL_DEL, fd, NULL );
+	} while (ret < 0 && errno == EINTR);
+	return ret;
 }
 
 void update_gps_status(GpsStatusValue val) {
-    V("%s", __func__);
-
-    GpsStatus* status = malloc(sizeof(GpsStatus));
-    status->size = sizeof(GpsStatus);
-    status->status = val;
-
-    enqueue_update_event(status, STATUS);
+	GpsState*  state = _gps_state;
+	//Should be made thread safe...
+	state->status.status=val;
+	D("state->status.status = %d, status_cb=%p", state->status.status, state->callbacks.status_cb);
+	if(state->callbacks.status_cb)
+		state->callbacks.status_cb(&state->status);
 }
 
 void update_gps_svstatus(GpsSvStatus *val) {
-    V("%s", __func__);
-
-    GpsSvStatus* sv_status = malloc(sizeof(GpsSvStatus));
-    memcpy(sv_status, val, sizeof(GpsSvStatus));
-    sv_status->size = sizeof(GpsSvStatus);
-
-    enqueue_update_event(sv_status, SV_STATUS);
+	GpsState*  state = _gps_state;
+	//Should be made thread safe...
+	if(state->callbacks.sv_status_cb)
+		state->callbacks.sv_status_cb(val);
 }
 
 void update_gps_location(GpsLocation *fix) {
-    V("%s", __func__);
-
-    GpsLocation* location = malloc(sizeof(GpsLocation));
-    memcpy(location, fix, sizeof(GpsLocation));
-    location->size = sizeof(GpsLocation);
-
-    enqueue_update_event(location, LOCATION);
+        GpsState*  state = _gps_state;
+        //Should be made thread safe...
+        if(state->callbacks.location_cb)
+                state->callbacks.location_cb(fix);
 }
 
-static void send_update_events(GpsState* state) {
-    int event_size;
-
-    pthread_mutex_lock(&state->update_mutex);
-    event_size = arraySize(state->update_events);
-
-    if (!event_size) {
-        pthread_mutex_unlock(&state->update_mutex);
-        return;
-    }
-
-    do {
-        GpsUpdateEvent* event = arrayRemove(state->update_events, 0);
-        switch (event->type) {
-            case STATUS: {
-                if (state->callbacks.status_cb) {
-                    D("%s: sending STATUS event (status=%d)", __func__,
-                        ((GpsStatus*)event->object)->status);
-                    state->callbacks.status_cb(event->object);
-                }
-                break;
-            }
-            case SV_STATUS: {
-                if (state->callbacks.sv_status_cb) {
-                    D("%s: sending SV_STATUS event (num_svs=%d)", __func__,
-                        ((GpsSvStatus*)event->object)->num_svs);
-                    state->callbacks.sv_status_cb(event->object);
-                }
-                break;
-            }
-            case LOCATION: {
-                if (state->callbacks.location_cb) {
-                    D("%s: sending LOCATION event (flags=0x%x)", __func__,
-                        ((GpsLocation*)event->object)->flags);
-                    state->callbacks.location_cb(event->object);
-                }
-                break;
-            }
-            default: {
-                D("%s: unknown event type %d", __func__, event->type);
-            }
-        }
-        free(event->object);
-        free(event);
-        --event_size;
-    } while (event_size > 0);
-
-    pthread_mutex_unlock(&state->update_mutex);
-}
-
-/* this is the main thread, it waits for commands from gps_state_thread_ctl() and,
+/* this is the main thread, it waits for commands from gps_state_start/stop and,
  * when started, messages from the NMEA SMD. these are simple NMEA sentences
  * that must be parsed to be converted into GPS fixes sent to the framework
  */
-uint32_t scan_interval = 0;
-static void gps_state_thread( void*  arg ) {
-    GpsState*   state = (GpsState*) arg;
-    NmeaReader  reader[1];
-    int         epoll_fd   = epoll_create(2);
-    int         started    = 0;
-    int         paused     = 0;
-    int         gps_fd     = state->fd;
-    int         control_fd = state->control[1];
+uint32_t _fix_frequency;//Which is a period not a frequency, but nvm.
+static void* gps_state_thread( void*  arg ) {
+	GpsState*   state = (GpsState*) arg;
+	NmeaReader  reader[1];
+	int         epoll_fd   = epoll_create(2);
+	int         started    = 0;
+	int         gps_fd     = state->fd;
+	int         control_fd = state->control[1];
 
-    // Engine is enabled when the thread is started.
-    GpsStatus gps_status;
-    memset(&gps_status, 0, sizeof(GpsStatus));
-    gps_status.size = sizeof(GpsStatus);
-    gps_status.status = GPS_STATUS_ENGINE_ON;
-    if(state->callbacks.status_cb)
-        state->callbacks.status_cb(&gps_status);
+	//Engine is enabled when the thread is started.
+	state->status.status=GPS_STATUS_ENGINE_ON;
+	if(state->callbacks.status_cb)
+		state->callbacks.status_cb(&state->status);
+	nmea_reader_init( reader );
 
-    nmea_reader_init( reader );
+	// register control file descriptors for polling
+	epoll_register( epoll_fd, control_fd );
+	if (gps_fd > -1) {
+		epoll_register( epoll_fd, gps_fd );
+	}
 
-    // register control file descriptors for polling
-    epoll_register( epoll_fd, control_fd );
-    if (gps_fd > -1) {
-        epoll_register( epoll_fd, gps_fd );
-    }
+	D("gps thread running");
 
-    D("%s: start tid=%d", __func__, gettid());
+	// now loop
+	for (;;) {
+		struct epoll_event   events[2];
+		int                  ne, nevents;
 
-    // now loop
-    for (;;) {
-        struct epoll_event   events[2];
-        int                  ne, nevents;
+		nevents = epoll_wait( epoll_fd, events, gps_fd>-1 ? 2 : 1, started ? (int)_fix_frequency*1000 : -1);
+		if (nevents < 0) {
+			//if (errno != EINTR)
+				LOGE("epoll_wait() unexpected error: %s", strerror(errno));
+			continue;
+		}
+		if(nevents==0) {
+			//We should call pdsm_get_position more often than that... but it's not easy to code.
+			//Anyway the 2second timeout is already stupid,
+			if(started)
+				gps_get_position();
+		}
+		D("gps thread received %d events", nevents);
+		for (ne = 0; ne < nevents; ne++) {
+			if ((events[ne].events & (EPOLLERR|EPOLLHUP)) != 0) {
+				LOGE("EPOLLERR or EPOLLHUP after epoll_wait() !?");
+				goto Exit;
+			}
+			if ((events[ne].events & EPOLLIN) != 0) {
+				int  fd = events[ne].data.fd;
 
-        nevents = epoll_wait( epoll_fd, events, gps_fd>-1 ? 2 : 1,
-            started ? (int)scan_interval : -1);
-        if (nevents < 0) {
-            if (errno != EINTR)
-                LOGE("epoll_wait() unexpected error: %s", strerror(errno));
-            continue;
-        }
-        for (ne = 0; ne < nevents; ne++) {
-            if ((events[ne].events & (EPOLLERR|EPOLLHUP)) != 0) {
-                LOGE("EPOLLERR or EPOLLHUP after epoll_wait() !?");
-                goto Exit;
-            }
-            if ((events[ne].events & EPOLLIN) != 0) {
-                int  fd = events[ne].data.fd;
-
-                if (fd == control_fd) {
-                    int   ret;
-                    int   i;
-                    char  buf[255];
-                    int   update_handled = 0;
-                    memset(buf, 0xff, 255);
-                    V("%s: control fd event", __func__);
-                    do {
-                        ret = read(fd, buf, 255);
-                    } while (ret < 0 && errno == EINTR);
-
-                    for (i = 0; i < ret && buf[i] != 0xff; i++) {
-                        char cmd = buf[i];
-                        V("%s: handling cmd=%d\n", __func__, cmd);
-                        if (cmd == CMD_QUIT) {
-                            V("%s: quit", __func__);
-                            gps_status.status = GPS_STATUS_ENGINE_OFF;
-                            if(state->callbacks.status_cb)
-                                state->callbacks.status_cb(&gps_status);
-                            goto Exit;
-                        } else if (cmd == CMD_START) {
-                            if (!started) {
-                                V("%s: start", __func__);
-                                started = 1;
-                                start_gps_rpc();
-                            }
-                        } else if (cmd == CMD_PAUSE) {
-                            paused = 1;
-                        } else if (cmd == CMD_RESUME) {
-                            paused = 0;
-                        } else if (cmd == CMD_STOP) {
-                            if (started) {
-                                V("%s: stop", __func__);
-                                started = 0;
-                                exit_gps_rpc();
-                            }
-                        } else if (cmd == CMD_SEND) {
-                            /* Don't try sending update events when we already
-                             * have in this run.
-                             */
-                            if (!update_handled) {
-                                send_update_events(state);
-                                update_handled = 1;
-                            }
-                        }
-                    }
-                } else if (fd == gps_fd) {
-                    char  buff[32];
-                    D("gps fd event");
-                    for (;;) {
-                        int  nn, ret;
-
-                        ret = read( fd, buff, sizeof(buff) );
-                        if (ret < 0) {
-                            if (errno == EINTR)
-                                continue;
-                            if (errno != EWOULDBLOCK)
-                            LOGE("error while reading from gps daemon socket: %s:", strerror(errno));
-                            break;
-                        }
-                        D("received %d bytes: %.*s", ret, ret, buff);
-                        for (nn = 0; nn < ret; nn++)
-                            nmea_reader_addc( reader, buff[nn] );
-                    }
-                    D("gps fd event end");
-                } else {
-                    LOGE("epoll_wait() returned unkown fd %d ?", fd);
-                }
-            }
-        }
-        if (started && !paused) {
-            gps_get_position();
-        }
-    }
+				if (fd == control_fd) {
+					char  cmd = 255;
+					int   ret;
+					D("gps control fd event");
+					do {
+						ret = read( fd, &cmd, 1 );
+					} while (ret < 0 && errno == EINTR);
+	
+					if (cmd == CMD_QUIT) {
+						D("gps thread quitting on demand");
+						goto Exit;
+					} else if (cmd == CMD_START) {
+						if (!started) {
+							D("gps thread starting  location_cb=%p", state->callbacks.location_cb);
+							started = 1;
+						}
+					} else if (cmd == CMD_STOP) {
+						if (started) {
+							D("gps thread stopping");
+							started = 0;
+							exit_gps_rpc();
+						}
+ 					}
+				} else if (fd == gps_fd) {
+					char  buff[32];
+					D("gps fd event");
+					for (;;) {
+						int  nn, ret;
+	
+						ret = read( fd, buff, sizeof(buff) );
+						if (ret < 0) {
+							if (errno == EINTR)
+								continue;
+							if (errno != EWOULDBLOCK)
+							LOGE("error while reading from gps daemon socket: %s:", strerror(errno));
+							break;
+						}
+						D("received %d bytes: %.*s", ret, ret, buff);
+						for (nn = 0; nn < ret; nn++)
+							nmea_reader_addc( reader, buff[nn] );
+					}
+					D("gps fd event end");
+				} else {
+					LOGE("epoll_wait() returned unkown fd %d ?", fd);
+				}
+			}
+		}
+	}
 Exit:
-    D("%s: exit tid=%d", __func__, gettid());
-    return;
+    return NULL;
 }
 
-static void gps_state_deinit(GpsState*);
 
-static void gps_state_init(GpsState* state) {
-    state->init       = 1;
-    state->control[0] = -1;
-    state->control[1] = -1;
-    state->fd = -1; // open("/dev/smd27", O_RDONLY );
-    state->update_events = arrayCreate();
-    pthread_mutex_init(&state->update_mutex, NULL);
+static void gps_state_init( GpsState*  state ) {
+	state->init       = 1;
+	state->control[0] = -1;
+	state->control[1] = -1;
+	state->fd = -1; // open("/dev/smd27", O_RDONLY );
 
-    if ( socketpair( AF_LOCAL, SOCK_STREAM, 0, state->control ) < 0 ) {
-        LOGE("%s: could not create thread control socket pair: %s", __func__,
-            strerror(errno));
-        goto Fail;
-    }
+	if ( socketpair( AF_LOCAL, SOCK_STREAM, 0, state->control ) < 0 ) {
+		LOGE("could not create thread control socket pair: %s", strerror(errno));
+		goto Fail;
+	}
 
-    state->thread = state->callbacks.create_thread_cb("gps_xdandroid",
-        gps_state_thread, state);
-    if (!state->thread) {
-        state->thread = 0;
-        LOGE("%s could not create gps state thread: %s", __func__,
-            strerror(errno));
-        goto Fail;
-    }
+	if ( pthread_create( &state->thread, NULL, gps_state_thread, state ) != 0 ) {
+		LOGE("could not create gps thread: %s", strerror(errno));
+		goto Fail;
+	}
+	if(init_gps_rpc())
+		goto Fail;
 
-    if(init_gps_rpc())
-        goto Fail;
-
-    D("%s: done", __func__);
-    return;
+	D("gps state initialized");
+	return;
 
 Fail:
-    gps_state_deinit( state );
+	gps_state_done( state );
 }
 
-static void gps_state_deinit(GpsState*  state) {
-    GpsUpdateEvent* event;
-
-    D("%s", __func__);
-
-    // tell the thread to quit, and wait for it
-    gps_state_thread_ctl(state, CMD_QUIT);
-    pthread_join(state->thread, NULL);
-
-    // close the control socket pair
-    close(state->control[0]);
-    state->control[0] = -1;
-    close(state->control[1]);
-    state->control[1] = -1;
-
-    // close connection to the QEMU GPS daemon
-    close(state->fd);
-    state->fd = -1;
-
-    state->init = 0;
-
-    // cleanup
-    pthread_mutex_lock(&state->update_mutex);
-    // free any pending events
-    while (arraySize(state->update_events)) {
-        event = arrayRemove(state->update_events, 0);
-        free(event->object);
-        free(event);
-    }
-    arrayFree(state->update_events);
-    state->update_events = NULL;
-    pthread_mutex_unlock(&state->update_mutex);
-    pthread_mutex_destroy(&state->update_mutex);
-}
 
 /*****************************************************************/
 /*****************************************************************/
@@ -930,226 +783,89 @@ static void gps_state_deinit(GpsState*  state) {
 /*****                                                       *****/
 /*****************************************************************/
 /*****************************************************************/
-/***** GpsXtraInterface *****/
 
-static int gps_xtra_init(GpsXtraCallbacks* callbacks) {
-    pr_dbg_xtra("%s() is called", __func__);
-    GpsState*  s = _gps_state;
-
-    s->xtra_callbacks = *callbacks;
-
-    return 0;
-}
-
-static int gps_xtra_inject_xtra_data(char* data, int length) {
-    pr_dbg_xtra("%s(): xtra size = %d, data ptr = 0x%x\n", __func__, length, (int) data);
-    GpsState*  s = _gps_state;
-    if (!s->init)
-        return 0;
-
-    gps_state_thread_ctl(s, CMD_PAUSE);
-
-    int rpc_ret_val = -1;
-    int ret_val = -1;
-    unsigned char *xtra_data_ptr;
-    uint32_t  part_len;
-    uint8_t   part;
-    uint8_t   total_parts;
-    uint16_t  len_injected;
-
-    total_parts = (length / XTRA_BLOCK_SIZE);
-    if ((total_parts % XTRA_BLOCK_SIZE) != 0)
-    {
-        total_parts += 1;
-    }
-
-    len_injected = 0; // O bytes injected
-    // XTRA injection starts with part 1
-    for (part = 1; part <= total_parts; part++)
-    {
-        part_len = XTRA_BLOCK_SIZE;
-        if (XTRA_BLOCK_SIZE > (length - len_injected))
-        {
-            part_len = length - len_injected;
-        }
-        xtra_data_ptr = data + len_injected;
-#if 0
-        pr_dbg_xtra("%s(): inject part = %d/%d, len = %d\n", __func__, part, total_parts, part_len);
-#endif
-        if (part < total_parts)
-        {
-            rpc_ret_val = gps_xtra_set_data(xtra_data_ptr, part_len, part, total_parts);
-            if (!rpc_ret_val)
-            {
-                LOGE("gps_xtra_set_data() for xtra returned %d, part=%d/%d, len=%d; aborting! \n", rpc_ret_val, part, total_parts, part_len);
-                ret_val = EINVAL; // return error
-                break;
-            }
-        }
-        else // part == total_parts
-        {
-            ret_val = gps_xtra_set_data(xtra_data_ptr, part_len, part, total_parts);
-            break; // done with injection
-        }
-
-        len_injected += part_len;
-    }
-
-    gps_state_thread_ctl(s, CMD_RESUME);
-    return ret_val;
-}
-
-static const GpsXtraInterface  sGpsXtraInterface = {
-    sizeof(GpsXtraInterface),
-    gps_xtra_init,
-    gps_xtra_inject_xtra_data,
-};
-
-/***** AGpsInterface *****/
-
-static void agps_init(AGpsCallbacks* callbacks) {
-    pr_dbg_xtra("%s() is called", __func__);
-    GpsState*  s = _gps_state;
-    s->agps_callbacks = *callbacks;
-
-}
-
-static int agps_data_conn_open(const char* apn) {
-    pr_dbg_xtra("%s(): apn=%s", __func__, apn);
-    /* not yet implemented */
-    return 0;
-}
-
-static int agps_data_conn_closed() {
-    pr_dbg_xtra("%s() is called", __func__);
-    /* not yet implemented */
-    return 0;
-}
-
-static int agps_data_conn_failed() {
-    pr_dbg_xtra("%s() is called", __func__);
-    /* not yet implemented */
-    return 0;
-}
-
-static int agps_set_server(AGpsType type, const char* hostname, int port) {
-    pr_dbg_xtra("%s(): type=%d, hostname=%s, port=%d", __func__, type, hostname, port);
-    /* not yet implemented */
-    return 0;
-}
-
-static const AGpsInterface  sAGpsInterface = {
-    sizeof(AGpsInterface),
-    agps_init,
-    agps_data_conn_open,
-    agps_data_conn_closed,
-    agps_data_conn_failed,
-    agps_set_server,
-};
 
 static int gps_init(GpsCallbacks* callbacks) {
-    GpsState* state = _gps_state;
+	GpsState*  s = _gps_state;
+	
+	memset(&s->status, 0, sizeof(&s->status));
+	s->status.size = sizeof(s->status);
+	s->status.status = GPS_STATUS_NONE;
 
-    LOGI("%s", __func__);
+	if (!s->init)
+		gps_state_init(s);
 
-    state->callbacks = *callbacks;
+	s->callbacks = *callbacks;
 
-    //if (!state->init)
-    //    gps_state_init(state);
-
-
-    return 0;
+	return 0;
 }
 
 static void gps_cleanup() {
-    GpsState* state = _gps_state;
+	GpsState*  s = _gps_state;
 
-    LOGI("%s", __func__);
-
-    if (state->init)
-        gps_state_deinit(state);
+	if (s->init)
+		gps_state_done(s);
 }
+
 
 static int gps_start() {
-    GpsState* state = _gps_state;
+	GpsState*  s = _gps_state;
 
-    if (!state->init) {
-        LOGI("%s: called with uninitialized state !!", __func__);
-        gps_state_init(state);
-    }
+	if (!s->init) {
+		D("%s: called with uninitialized state !!", __FUNCTION__);
+		if(!s)
+			return -1;
+		gps_state_init(s);
+	}
 
-    LOGI("%s", __func__);
-
-    gps_state_thread_ctl(state, CMD_START);
-    return 0;
+	D("%s: called", __FUNCTION__);
+	gps_state_start(s);
+	return 0;
 }
+
 
 static int gps_stop() {
-    GpsState* state = _gps_state;
+	GpsState*  s = _gps_state;
 
-    if (!state->init) {
-        LOGI("%s: called with uninitialized state !!", __func__);
-        return -1;
-    }
+	if (!s->init) {
+		D("%s: called with uninitialized state !!", __FUNCTION__);
+		return -1;
+	}
 
-    LOGI("%s", __func__);
-
-    gps_state_thread_ctl(state, CMD_STOP);
-    return 0;
+	D("%s: called", __FUNCTION__);
+	gps_state_stop(s);
+	return 0;
 }
 
+
 static int gps_inject_time(GpsUtcTime time, int64_t timeReference, int uncertainty) {
-    pr_dbg_xtra("%s(): time=%lld, timeReference=%lld, uncertainty=%d", __func__, time, timeReference, uncertainty);
-    GpsState*  s = _gps_state;
-    if (!s->init)
-        return 0;
-    /* detule: Causes ARM9 crash on RHOD400, disable for now */
-/*
-    int ret_val = -1;
-    ret_val = gps_xtra_inject_time_info(time, timeReference, uncertainty);
-    return ret_val;
-*/
-    return 0;
+	return 0;
 }
 
 static int gps_inject_location(double latitude, double longitude, float accuracy) {
-    pr_dbg_xtra("%s", __func__);
-    return 0;
+	return 0;
 }
 
 static void gps_delete_aiding_data(GpsAidingData flags) {
-    pr_dbg_xtra("%s", __func__);
 }
 
-static int gps_set_position_mode(GpsPositionMode mode,
-    GpsPositionRecurrence recurrence, uint32_t min_interval,
-    uint32_t preferred_accuracy, uint32_t preferred_time) {
-
-    scan_interval = min_interval;
-    if (scan_interval == 0) {
-        //We don't handle single shot requests atm...
-        //So one every 4seconds will it be.
-        scan_interval=4000;
-    }
-    if (scan_interval > 6000) {
-        //Ok, A9 will timeout with so high value.
-        //Set it to 6. This used to be 8 seconds, which didn't work out either.
-        scan_interval=6000;
-    }
-
-    D("%s: scan_interval=%u (requested=%u)", __func__, scan_interval, min_interval);
-
-    return 0;
+static int gps_set_position_mode(GpsPositionMode mode, GpsPositionRecurrence recurrence, uint32_t fix_frequency, uint32_t preferred_accuracy, uint32_t preferred_time) {
+	_fix_frequency=(uint32_t) fix_frequency;
+	if(_fix_frequency==0) {
+		//We don't handle single shot requests atm...
+		//So one every 4seconds will it be.
+		_fix_frequency=4;
+	}
+	if(_fix_frequency>8) {
+		//Ok, A9 will timeout with so high value.
+		//Set it to 8.
+		_fix_frequency=8;
+	}
+	return 0;
 }
 
 static const void* gps_get_extension(const char* name) {
-    pr_dbg_xtra("%s('%s') is called", __func__, name);
-    if (!strcmp(name, GPS_XTRA_INTERFACE)) {
-        return &sGpsXtraInterface;
-    } else if (!strcmp(name, AGPS_INTERFACE)) {
-        return &sAGpsInterface;
-    }
-    return NULL;
+	return NULL;
 }
 
 static const GpsInterface  hardwareGpsInterface = {
@@ -1165,6 +881,8 @@ static const GpsInterface  hardwareGpsInterface = {
     gps_get_extension,
 };
 
-const GpsInterface* gps_get_hardware_interface() {
+const GpsInterface* gps_get_hardware_interface()
+{
     return &hardwareGpsInterface;
 }
+
